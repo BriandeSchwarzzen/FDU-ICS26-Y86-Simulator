@@ -22,12 +22,12 @@ class Y86Simulator:
         self.memory = bytearray(mem_size)
         self.PC = 0
         self.STAT = AOK
-        
+
         self.REG = {i: 0 for i in range(15)}
-        self.REG[RNONE] = 0 
-        
+        self.REG[RNONE] = 0
+
         self.CC = {"ZF": 1, "SF": 0, "OF": 0}
-        
+
         # CPU 内部暂存器 / 数据通路状态变量 (用于在多周期状态机的各阶段间传递当前指令的数据)
         self.icode = I_NOP
         self.ifun = 0
@@ -50,16 +50,16 @@ class Y86Simulator:
         if val & 0x8000000000000000:
             val -= 0x10000000000000000
         return val
-    
+
     def sign_extend(self, val, bits=64):
         """将指定位数的无符号整数转换为补码有符号整数"""
         sign_bit = 1 << (bits - 1)
         return (val & (sign_bit - 1)) - (val & sign_bit)
-    
+
     def uint64(self, val):
         """将数值截断为 64 位无符号整数"""
         return val & 0xFFFFFFFFFFFFFFFF
-        
+
     def read_mem(self, addr, size):
         """从指定内存地址读取指定字节数的数据，若地址越界则触发 ADR 异常"""
         if addr < 0 or addr + size > self.mem_size:
@@ -79,21 +79,21 @@ class Y86Simulator:
             return
         if size == 8:
             self.memory[addr : addr+size] = struct.pack('<Q', self.uint64(val))
-            
+
     def check_cond(self, ifun):
         """根据当前条件码寄存器，判断跳转或条件传送是否满足"""
         zf, sf, of = self.CC["ZF"], self.CC["SF"], self.CC["OF"]
-        if ifun == 0: return True                  
-        if ifun == 1: return (sf ^ of) | zf        
-        if ifun == 2: return sf ^ of               
-        if ifun == 3: return zf                    
-        if ifun == 4: return not zf                
-        if ifun == 5: return not (sf ^ of)         
-        if ifun == 6: return not (sf ^ of) and not zf 
+        if ifun == 0: return True
+        if ifun == 1: return (sf ^ of) | zf
+        if ifun == 2: return sf ^ of
+        if ifun == 3: return zf
+        if ifun == 4: return not zf
+        if ifun == 5: return not (sf ^ of)
+        if ifun == 6: return not (sf ^ of) and not zf
         return False
 
     # ---------------- 核心 FSM 逻辑 (需实现) ----------------
-    
+
     def fetch(self):
         """
         取指阶段 (Fetch)
@@ -106,22 +106,49 @@ class Y86Simulator:
         4. 如果 need_reg，读取寄存器指示符并分别赋值给 self.rA 和 self.rB。
         5. 如果 need_valC，读取 8 字节常数赋值给 self.valC。
         6. 计算出下一条指令的地址，并赋值给 self.valP。
-        
+
         提示: 使用 read_mem(addr, size) 读取内存。注意更新地址偏移量。
         """
+        # 1. PC 越界检查 (取指本身越界 -> ADR)
         if self.PC < 0 or self.PC >= self.mem_size:
             self.STAT = ADR
             return
-            
+
         byte0 = self.read_mem(self.PC, 1)
         if self.STAT != AOK: return
-        
+
         # 已经为你提取出了当前指令的操作码，请保留下方两条赋值，继续向下实现
         self.icode = byte0 >> 4
         self.ifun = byte0 & 0x0F
-        
-        # TODO: 请在此处实现取指阶段的完整逻辑
-        pass
+
+        # 2. 操作码合法性检查
+        if self.icode == I_HALT:            # halt -> HLT 停机
+            self.STAT = HLT
+            return
+        if self.icode > I_POPQ:             # 0xC ~ 0xF 非法 -> INS
+            self.STAT = INS
+            return
+
+        # 3. 确定指令长度: 寄存器指示符字节 / 8 字节常数
+        need_reg  = self.icode in (I_RRMOVQ, I_IRMOVQ, I_RMMOVQ,
+                                   I_MRMOVQ, I_ALU, I_PUSHQ, I_POPQ)
+        need_valC = self.icode in (I_IRMOVQ, I_RMMOVQ, I_MRMOVQ, I_JMP, I_CALL)
+
+        pos = self.PC + 1
+        # 4. 读寄存器指示符
+        if need_reg:
+            byte = self.read_mem(pos, 1)
+            if self.STAT != AOK: return
+            self.rA = byte >> 4
+            self.rB = byte & 0x0F
+            pos += 1
+        # 5. 读 8 字节常数 (小端)
+        if need_valC:
+            self.valC = self.read_mem(pos, 8)
+            if self.STAT != AOK: return
+            pos += 8
+        # 6. 下一条指令地址
+        self.valP = pos
 
     def decode(self):
         """
@@ -134,9 +161,20 @@ class Y86Simulator:
         """
         srcA = RNONE
         srcB = RNONE
-        
-        # TODO: 请在此处实现译码阶段的完整逻辑，正确设置 srcA 和 srcB，并读取赋值给 valA 和 valB
-        pass
+
+        # 按 CS:APP 图 4-22 的 SEQ 译码逻辑确定 srcA / srcB
+        if self.icode in (I_RRMOVQ, I_RMMOVQ, I_ALU, I_PUSHQ):
+            srcA = self.rA
+        if self.icode in (I_RMMOVQ, I_MRMOVQ, I_ALU, I_PUSHQ, I_POPQ):
+            srcB = self.rB
+        # 隐式使用 %rsp 的指令
+        if self.icode in (I_PUSHQ, I_POPQ, I_CALL, I_RET):
+            srcB = RSP
+        if self.icode in (I_POPQ, I_RET):
+            srcA = RSP   # popq/ret 的访存地址来自旧 %rsp
+
+        self.valA = self.REG[srcA]   # RNONE 时读出 0
+        self.valB = self.REG[srcB]
 
     def execute(self):
         """
@@ -157,12 +195,66 @@ class Y86Simulator:
         """
         self.valE = 0
         self.Cnd = False
-        
+
         aluA = 0
         aluB = 0
-        
-        # TODO: 请在此处实现执行阶段的完整逻辑，包含 ALU 运算、条件码更新和分支跳转判定
-        pass
+
+        icode = self.icode
+
+        # --- ALU 操作数选择 ---
+        if icode == I_ALU:                       # OPq: 运算在寄存器之间
+            aluA = self.valA
+            aluB = self.valB
+        elif icode in (I_RMMOVQ, I_MRMOVQ):      # 访存: 有效地址 = valB + valC
+            aluB = self.valB
+            aluA = self.valC
+        elif icode in (I_PUSHQ, I_CALL):         # 栈指针 -8
+            aluB = self.valB
+            aluA = -8
+        elif icode in (I_POPQ, I_RET):           # 栈指针 +8
+            aluB = self.valB
+            aluA = 8
+        elif icode == I_RRMOVQ:                  # rrmovq: valE = 0 + valA
+            aluB = 0
+            aluA = self.valA
+        elif icode == I_IRMOVQ:                  # irmovq: valE = 0 + valC
+            aluB = 0
+            aluA = self.valC
+
+        # --- ALU 运算 ---
+        if icode == I_ALU:
+            a = self.valA
+            b = self.valB
+            if self.ifun == 0:      # addq
+                self.valE = self.uint64(a + b)
+            elif self.ifun == 1:    # subq
+                self.valE = self.uint64(b - a)
+            elif self.ifun == 2:    # andq
+                self.valE = self.uint64(a & b)
+            elif self.ifun == 3:    # xorq
+                self.valE = self.uint64(a ^ b)
+            # 更新条件码 ZF / SF / OF
+            r = self.valE
+            self.CC["ZF"] = 1 if r == 0 else 0
+            self.CC["SF"] = (r >> 63) & 1
+            a_s = self.to_signed64(a)
+            b_s = self.to_signed64(b)
+            r_s = self.to_signed64(r)
+            if self.ifun == 0:      # addq 溢出: 同号相加结果变号
+                of = ((a_s > 0 and b_s > 0 and r_s < 0) or
+                      (a_s < 0 and b_s < 0 and r_s >= 0))
+            elif self.ifun == 1:    # subq 溢出: 异号相减结果与被减数异号
+                of = ((a_s < 0 and b_s > 0 and r_s < 0) or
+                      (a_s > 0 and b_s < 0 and r_s > 0))
+            else:                   # andq / xorq 不产生溢出
+                of = 0
+            self.CC["OF"] = 1 if of else 0
+        else:
+            self.valE = self.uint64(aluB + aluA)
+
+        # --- 条件判断 (jXX / cmovXX / jmp / rrmovq 均按 ifun 判定) ---
+        if icode in (I_JMP, I_RRMOVQ):
+            self.Cnd = self.check_cond(self.ifun)
 
     def memory_stage(self):
         """
@@ -176,9 +268,21 @@ class Y86Simulator:
            如果是，调用 self.read_mem(addr, 8) 读取 8 字节数据，并赋值给 self.valM。
         """
         self.valM = 0
-        
-        # TODO: 请在此处实现访存阶段的完整读写逻辑
-        pass
+
+        icode = self.icode
+        # --- 写内存: 地址 = valE ---
+        if icode == I_RMMOVQ:
+            self.write_mem(self.valE, 8, self.valA)
+        elif icode == I_PUSHQ:
+            self.write_mem(self.valE, 8, self.valA)   # 压入旧 %rsp 值 (valA)
+        elif icode == I_CALL:
+            self.write_mem(self.valE, 8, self.valP)   # 压入返回地址
+        # --- 读内存 ---
+        elif icode == I_MRMOVQ:
+            self.valM = self.read_mem(self.valE, 8)
+        elif icode in (I_POPQ, I_RET):
+            self.valM = self.read_mem(self.valA, 8)   # 从旧 %rsp 指向处弹出
+        # (越界时 read_mem/write_mem 已把 STAT 置为 ADR, 写回阶段仍会执行)
 
     def write_back(self):
         """
@@ -193,9 +297,29 @@ class Y86Simulator:
         """
         dstE = RNONE
         dstM = RNONE
-        
-        # TODO: 请在此处实现寄存器写回的完整逻辑
-        pass
+
+        icode = self.icode
+        # --- dstE ---
+        if icode in (I_RRMOVQ, I_IRMOVQ, I_ALU):
+            dstE = self.rB
+        elif icode in (I_PUSHQ, I_POPQ, I_CALL, I_RET):
+            dstE = RSP
+        # --- dstM ---
+        if icode == I_MRMOVQ:
+            dstM = self.rA
+        elif icode == I_POPQ:
+            dstM = self.rA
+        # 注意: ret 的返回地址只进入 PC (update_pc 取 valM), 不写回 rsp
+
+        # cmovXX: 仅当条件成立才写回 (rrmovq 的 ifun=0 恒成立)
+        if icode == I_RRMOVQ and not self.Cnd:
+            dstE = RNONE
+
+        if dstE != RNONE:
+            self.REG[dstE] = self.uint64(self.valE)
+        # valM 后写, 保证 popq %rsp 时内存值覆盖 valE (rsp+8)
+        if dstM != RNONE:
+            self.REG[dstM] = self.uint64(self.valM)
 
     def update_pc(self):
         """
@@ -207,8 +331,14 @@ class Y86Simulator:
         - ret 指令：PC 更新为从栈中弹出的返回地址 (valM)。
         - 其它默认情况：PC 顺序更新为下一条指令的地址 (valP)。
         """
-        # TODO: 请在此处实现 PC 更新逻辑
-        pass
+        if self.icode == I_CALL:
+            self.PC = self.valC
+        elif self.icode == I_JMP:
+            self.PC = self.valC if self.Cnd else self.valP
+        elif self.icode == I_RET:
+            self.PC = self.valM
+        else:
+            self.PC = self.valP
 
     # ---------------- JSON 序列化输出 ----------------
     def dump_state(self):
@@ -249,23 +379,23 @@ class Y86Simulator:
         """主循环：时钟步进"""
         while self.STAT == AOK:
             self.fetch()
-            if self.STAT != AOK: 
+            if self.STAT != AOK:
                 self.dump_state()
                 break
-                
+
             self.decode()
             self.execute()
             self.memory_stage()
-            
+
             self.write_back()
-            
-            if self.STAT != AOK: 
+
+            if self.STAT != AOK:
                 self.dump_state()
                 break
-                
+
             self.update_pc()
             self.dump_state()
-            
+
         print(json.dumps(self.trace, indent=4))
 
 if __name__ == "__main__":
